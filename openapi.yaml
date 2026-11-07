@@ -1,0 +1,1083 @@
+openapi: 3.1.0
+info:
+  title: Cots Admin API
+  version: 1.0.0
+  description: |
+    API of **admin-be**, the backend of the Cots admin console.
+
+    - **Versioning:** every route is under `/api/v1`. `/healthz` and `/readyz` sit at the root.
+      The unversioned `/api/*` paths are a deprecated alias of v1 (they answer with `Deprecation: true`).
+    - **Auth:** WorkOS SSO, entirely server-side. `GET /api/v1/auth/login` redirects to WorkOS;
+      the callback sets the `cots_admin_session` cookie (httpOnly). Every other route needs that cookie.
+    - **Scope:** dashboard, agents and actions also need `x-tenant-id` + `x-environment-id`
+      (a tenant/environment the user can access, on the session's platform).
+    - **Platform:** chosen once per sign-in (`POST /api/v1/me/platform`) and fixed for the session.
+    - **Permissions:** RBAC; each operation lists the permission it needs. `super_admin` has all of them.
+    - **Errors:** `{"error": {"code", "message", "detail?"}}`.
+
+    **Trying requests:** the session cookie belongs to the admin console's domain, so authenticated
+    calls work from the console itself or from Postman (copy the `cots_admin_session` cookie from the
+    browser after signing in). From this page, "Try it out" works for the public endpoints.
+servers:
+  - url: https://admin-dev.cots.ai
+    description: dev, through the admin console (Vercel proxies /api/* -- session cookie works here)
+  - url: https://admin-dev-api.cots.ai
+    description: dev, admin-be directly
+  - url: http://localhost:4100
+    description: local admin-be
+tags:
+  - name: Health
+  - name: Auth
+  - name: Me
+    description: Session platform and the user's saved tenant/environment.
+  - name: Configs
+  - name: Access
+    description: Users, role assignments and roles (RBAC).
+  - name: Restrictions
+    description: Ops scripts (seed + link a WorkOS user).
+  - name: Tenants
+  - name: Dashboard
+  - name: Agents
+  - name: Actions
+    description: Propose and execute actions through the platform's action gateway.
+security:
+  - session: []
+
+paths:
+  # ------------------------------------------------------------------ health
+  /healthz:
+    get:
+      tags: [Health]
+      summary: Liveness -- the process is up (never touches the database)
+      operationId: healthz
+      security: []
+      responses:
+        "200":
+          description: Up
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Health" }
+              example: { status: ok }
+  /readyz:
+    get:
+      tags: [Health]
+      summary: Readiness -- database reachable within 2 s and not shutting down
+      operationId: readyz
+      security: []
+      responses:
+        "200":
+          description: Ready
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Health" }
+              example: { status: ok, checks: { database: ok } }
+        "503":
+          description: Not ready (database unreachable, or shutting down)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Health" }
+              examples:
+                database: { value: { status: unavailable, checks: { database: unreachable } } }
+                shutdown: { value: { status: unavailable, checks: { server: shutting_down } } }
+
+  # -------------------------------------------------------------------- auth
+  /api/v1/auth/login:
+    get:
+      tags: [Auth]
+      summary: Start SSO -- redirects to WorkOS AuthKit
+      description: Open in a browser (full navigation), not with fetch.
+      operationId: authLogin
+      security: []
+      responses:
+        "302": { description: Redirect to WorkOS (or to dev-login when AUTH_DEV_BYPASS is on) }
+  /api/v1/auth/callback:
+    get:
+      tags: [Auth]
+      summary: WorkOS redirect target -- sets the session cookie, redirects to the console
+      description: Reached via the console's `/callback` (the WorkOS redirect URI). Not called directly.
+      operationId: authCallback
+      security: []
+      parameters:
+        - { name: code, in: query, schema: { type: string } }
+        - { name: state, in: query, schema: { type: string } }
+        - { name: error, in: query, schema: { type: string } }
+      responses:
+        "302": { description: "To <frontend>/dashboard, or <frontend>/login?error=<code>" }
+  /api/v1/auth/dev-login:
+    get:
+      tags: [Auth]
+      summary: Local only -- sign in without WorkOS (AUTH_DEV_BYPASS=true)
+      operationId: authDevLogin
+      security: []
+      responses:
+        "302": { description: "Signed in, redirect to the console" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/auth/me:
+    get:
+      tags: [Auth]
+      summary: The signed-in user and their global permissions
+      operationId: authMe
+      responses:
+        "200":
+          description: Signed in
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user: { $ref: "#/components/schemas/User" }
+                  permissions: { type: array, items: { type: string }, example: [configs.view, users.view] }
+                  sso: { type: string, enum: [workos, dev_bypass] }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+  /api/v1/auth/logout:
+    post:
+      tags: [Auth]
+      summary: End the session
+      operationId: authLogout
+      responses:
+        "200":
+          description: Signed out; send the browser to logoutUrl (WorkOS logout, then back to /login)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  logoutUrl: { type: string, format: uri }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+
+  # ---------------------------------------------------------------------- me
+  /api/v1/me/platforms:
+    get:
+      tags: [Me]
+      summary: Platforms the user may choose, and the one fixed for this session
+      operationId: mePlatforms
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  platforms: { type: array, items: { $ref: "#/components/schemas/PlatformInfo" } }
+                  session_platform: { type: [string, "null"], example: release0 }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+  /api/v1/me/platform:
+    post:
+      tags: [Me]
+      summary: Choose the platform for this sign-in (once; it can't be changed later)
+      operationId: meChoosePlatform
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [platform]
+              properties:
+                platform: { type: string, example: release0 }
+      responses:
+        "200":
+          description: Chosen; returns the scope (same shape as GET /me/scope)
+          content: { application/json: { schema: { $ref: "#/components/schemas/ScopeState" } } }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /api/v1/me/scope:
+    get:
+      tags: [Me]
+      summary: Saved tenant/environment (user_configs), suggestion, platforms and permissions
+      operationId: meGetScope
+      responses:
+        "200":
+          description: OK
+          content: { application/json: { schema: { $ref: "#/components/schemas/ScopeState" } } }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+    put:
+      tags: [Me]
+      summary: Save the selected tenant/environment (access is checked first)
+      operationId: meSaveScope
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tenant_id, environment_id]
+              properties:
+                tenant_id: { type: string, example: "release0:ten_acme" }
+                environment_id: { type: string, example: "6f1c0d2e-1111-4a5b-9c8d-123456789abc" }
+      responses:
+        "200":
+          description: Saved
+          content: { application/json: { schema: { $ref: "#/components/schemas/ScopeState" } } }
+        "400": { $ref: "#/components/responses/ValidationFailed" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/PlatformNotChosen" }
+
+  # ----------------------------------------------------------------- configs
+  /api/v1/configs:
+    get:
+      tags: [Configs]
+      summary: "List configs (credentials masked unless configs.manage). Permission: configs.view"
+      operationId: configsList
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  configs: { type: array, items: { $ref: "#/components/schemas/Config" } }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    post:
+      tags: [Configs]
+      summary: "Create a config. Permission: configs.manage"
+      description: |
+        Platform configs use `setting_id: platform`, `data_type: json` and data like
+        `{"platform":"release0","name":"Release 0","target":{"api":"https://release0-api.cots.ai","database_url_env":"PLATFORM_DATABASE_URL_RELEASE0"},"sort_order":10}`.
+        `database_url_env` is the NAME of an env var on the admin server, never the URL.
+      operationId: configsCreate
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ConfigCreate" }
+            example: { setting_id: scope, key: default_environment, data: env_dev, data_type: text, status: active }
+      responses:
+        "201":
+          description: Created
+          content: { application/json: { schema: { $ref: "#/components/schemas/Config" } } }
+        "400": { $ref: "#/components/responses/ValidationFailed" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/v1/configs/{id}:
+    parameters: [{ $ref: "#/components/parameters/Id" }]
+    put:
+      tags: [Configs]
+      summary: "Update a config. Permission: configs.manage"
+      operationId: configsUpdate
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ConfigUpdate" }
+      responses:
+        "200":
+          description: Updated
+          content: { application/json: { schema: { $ref: "#/components/schemas/Config" } } }
+        "400": { $ref: "#/components/responses/ValidationFailed" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [Configs]
+      summary: "Delete a config. Permission: configs.manage"
+      operationId: configsDelete
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  # ------------------------------------------------------------------ access
+  /api/v1/access/users:
+    get:
+      tags: [Access]
+      summary: "List admin users with their role assignments. Permission: users.view"
+      operationId: accessListUsers
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  users: { type: array, items: { $ref: "#/components/schemas/UserRow" } }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    post:
+      tags: [Access]
+      summary: "Add a user and send an invitation email. Permission: users.manage"
+      operationId: accessCreateUser
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string, format: email, example: someone@cots.ai }
+                name: { type: [string, "null"], maxLength: 200, example: Some One }
+      responses:
+        "201":
+          description: Created (the invitation is best-effort; see the response)
+          content: { application/json: { schema: { type: object, additionalProperties: true } } }
+        "400": { $ref: "#/components/responses/ValidationFailed" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/v1/access/users/{id}:
+    parameters: [{ $ref: "#/components/parameters/Id" }]
+    patch:
+      tags: [Access]
+      summary: "Rename, disable or re-enable a user. Permission: users.manage"
+      operationId: accessUpdateUser
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: [string, "null"], maxLength: 200 }
+                status: { type: string, enum: [active, disabled] }
+      responses:
+        "200":
+          description: Updated
+          content: { application/json: { schema: { $ref: "#/components/schemas/User" } } }
+        "400": { $ref: "#/components/responses/ValidationFailed" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/access/users/{id}/invite:
+    parameters: [{ $ref: "#/components/parameters/Id" }]
+    post:
+      tags: [Access]
+      summary: "Resend the invitation email. Permission: users.manage"
+      operationId: accessResendInvitation
+      responses:
+        "200":
+          description: Sent (or why not)
+          content: { application/json: { schema: { type: object, additionalProperties: true } } }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/access/users/{id}/roles:
+    parameters: [{ $ref: "#/components/parameters/Id" }]
+    post:
+      tags: [Access]
+      summary: "Assign a role. Permission: users.manage"
+      description: |
+        Level of the assignment:
+        - no platform, no tenant: everywhere (only super admins may grant this, and only they may grant super_admin);
+        - platform only: every tenant of that platform;
+        - tenant (+ its platform): that tenant;
+        - tenant + environment_id: that environment only.
+      operationId: accessAssignRole
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [role_id]
+              properties:
+                role_id: { type: string, format: uuid }
+                platform: { type: [string, "null"], example: release0 }
+                tenant_id: { type: [string, "null"], example: "release0:ten_acme" }
+                environment_id: { type: [string, "null"], format: uuid }
+      responses:
+        "201": { $ref: "#/components/responses/Ok" }
+        "400": { $ref: "#/components/responses/ValidationFailed" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/v1/access/users/{id}/roles/{assignmentId}:
+    parameters:
+      - { $ref: "#/components/parameters/Id" }
+      - { name: assignmentId, in: path, required: true, schema: { type: string, format: uuid } }
+    delete:
+      tags: [Access]
+      summary: "Remove a role assignment (the last super admin can't be removed). Permission: users.manage"
+      operationId: accessUnassignRole
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+        "400": { $ref: "#/components/responses/Rejected" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/access/targets:
+    get:
+      tags: [Access]
+      summary: "Platforms, tenants and environments a role can be assigned on. Permission: users.view"
+      operationId: accessTargets
+      responses:
+        "200":
+          description: OK
+          content: { application/json: { schema: { type: object, additionalProperties: true } } }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /api/v1/access/roles:
+    get:
+      tags: [Access]
+      summary: "Roles and all permissions. Permission: users.view"
+      operationId: accessListRoles
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  roles: { type: array, items: { $ref: "#/components/schemas/Role" } }
+                  permissions: { type: array, items: { $ref: "#/components/schemas/Permission" } }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    post:
+      tags: [Access]
+      summary: "Create a custom role. Permission: roles.manage"
+      operationId: accessCreateRole
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RoleCreate" }
+            example: { key: support_agent, name: Support agent, description: Read-only support access, permissions: [dashboard.view, agents.view, actions.view] }
+      responses:
+        "201":
+          description: Created
+          content: { application/json: { schema: { $ref: "#/components/schemas/Role" } } }
+        "400": { $ref: "#/components/responses/ValidationFailed" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/v1/access/roles/{id}:
+    parameters: [{ $ref: "#/components/parameters/Id" }]
+    put:
+      tags: [Access]
+      summary: "Update a custom role (built-in roles are locked). Permission: roles.manage"
+      operationId: accessUpdateRole
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RoleUpdate" }
+      responses:
+        "200":
+          description: Updated
+          content: { application/json: { schema: { $ref: "#/components/schemas/Role" } } }
+        "400": { $ref: "#/components/responses/ValidationFailed" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [Access]
+      summary: "Delete a custom role. Permission: roles.manage"
+      operationId: accessDeleteRole
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+        "400": { $ref: "#/components/responses/Rejected" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  # ------------------------------------------------------------ restrictions
+  /api/v1/restrictions/workos:
+    get:
+      tags: [Restrictions]
+      summary: "Tenants of the session platform + their email domains, and whether scripts are enabled. Permission: restrictions.workos"
+      operationId: restrictionsWorkosTargets
+      parameters:
+        - { name: platform, in: query, description: Must equal the session platform when given, schema: { type: string, example: release0 } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  platform: { type: string, example: release0 }
+                  enabled: { type: boolean }
+                  reason: { type: [string, "null"], description: Why the page is disabled (null when enabled) }
+                  tenants:
+                    type: array
+                    items:
+                      allOf:
+                        - { $ref: "#/components/schemas/Tenant" }
+                        - type: object
+                          properties:
+                            domains: { type: array, items: { type: string }, example: [acme.com] }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/PlatformNotChosen" }
+  /api/v1/restrictions/workos/run:
+    post:
+      tags: [Restrictions]
+      summary: "Run seed-cots-workos.sh (seed + link a WorkOS user). Permission: restrictions.workos"
+      description: One run at a time, 90 s timeout; every run is audited. The output is returned in order (stdout + stderr).
+      operationId: restrictionsWorkosRun
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [platform, tenant_id, email]
+              properties:
+                platform: { type: string, example: release0 }
+                tenant_id: { type: string, example: "release0:ten_acme" }
+                email: { type: string, format: email, example: someone@cots.ai }
+                dry_run: { type: boolean, default: false }
+                skip_seed: { type: boolean, default: false }
+      responses:
+        "200":
+          description: Finished (check exit_code / timed_out)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  exit_code: { type: [integer, "null"] }
+                  timed_out: { type: boolean }
+                  dry_run: { type: boolean }
+                  duration_ms: { type: integer }
+                  command: { type: string, description: The exact command that ran }
+                  output: { type: string, description: "stdout + stderr in arrival order, ANSI codes stripped" }
+                additionalProperties: true
+        "400": { $ref: "#/components/responses/ValidationFailed" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  # ----------------------------------------------------------------- tenants
+  /api/v1/tenants:
+    get:
+      tags: [Tenants]
+      summary: Tenants the user can access on the session platform (synced from the platform database)
+      operationId: tenantsList
+      parameters:
+        - { name: platform, in: query, description: Must equal the session platform when given, schema: { type: string } }
+      responses:
+        "200":
+          description: OK. sync_error is set when the platform database can't be read.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tenants: { type: array, items: { $ref: "#/components/schemas/Tenant" } }
+                  sync_error: { type: [string, "null"], example: null }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "409": { $ref: "#/components/responses/PlatformNotChosen" }
+    post:
+      tags: [Tenants]
+      summary: "Add or update a tenant by hand. Permission: tenants.manage"
+      operationId: tenantsUpsert
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [platform, id, name]
+              properties:
+                platform: { type: string, example: release0 }
+                id: { type: string, description: The platform's tenant id, example: ten_acme }
+                name: { type: string, example: Acme Insurance }
+      responses:
+        "201":
+          description: Saved
+          content: { application/json: { schema: { type: object, additionalProperties: true } } }
+        "400": { $ref: "#/components/responses/ValidationFailed" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /api/v1/tenants/{tenantId}/environments:
+    parameters:
+      - { name: tenantId, in: path, required: true, schema: { type: string, example: "release0:ten_acme" } }
+    get:
+      tags: [Tenants]
+      summary: Environments of a tenant the user can access
+      operationId: tenantsListEnvironments
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  environments: { type: array, items: { $ref: "#/components/schemas/Environment" } }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    post:
+      tags: [Tenants]
+      summary: "Add or update an environment by hand. Permission: tenants.manage"
+      operationId: tenantsUpsertEnvironment
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [slug, name]
+              properties:
+                slug: { type: string, pattern: "^[a-z0-9-]{1,50}$", example: dev }
+                name: { type: string, example: Development }
+                cots_environment_id: { type: [string, "null"], example: env_dev }
+                gateway_url: { type: [string, "null"], format: uri }
+      responses:
+        "201":
+          description: Saved
+          content: { application/json: { schema: { type: object, additionalProperties: true } } }
+        "400": { $ref: "#/components/responses/ValidationFailed" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  # --------------------------------------------------------------- dashboard
+  /api/v1/dashboard:
+    get:
+      tags: [Dashboard]
+      summary: "Summary for the selected tenant/environment. Permission: dashboard.view"
+      operationId: dashboardSummary
+      parameters: [{ $ref: "#/components/parameters/TenantId" }, { $ref: "#/components/parameters/EnvironmentId" }]
+      responses:
+        "200":
+          description: OK
+          content: { application/json: { schema: { type: object, additionalProperties: true } } }
+        "400": { $ref: "#/components/responses/ScopeRequired" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  # ------------------------------------------------------------------ agents
+  /api/v1/agents/catalog:
+    get:
+      tags: [Agents]
+      summary: "Search the platform's agents (synced). Permission: agents.view"
+      operationId: agentsSearchCatalog
+      parameters:
+        - { $ref: "#/components/parameters/TenantId" }
+        - { $ref: "#/components/parameters/EnvironmentId" }
+        - { name: q, in: query, description: Search text, schema: { type: string } }
+        - { name: refresh, in: query, description: "1 = force a sync from the platform now", schema: { type: string, enum: ["1"] } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  agents: { type: array, items: { $ref: "#/components/schemas/CatalogAgent" } }
+        "400": { $ref: "#/components/responses/ScopeRequired" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    post:
+      tags: [Agents]
+      summary: "Add an agent to the catalog by hand. Permission: agents.catalog"
+      operationId: agentsAddToCatalog
+      parameters: [{ $ref: "#/components/parameters/TenantId" }, { $ref: "#/components/parameters/EnvironmentId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [cots_agent_id, name]
+              properties:
+                cots_agent_id: { type: string, example: agt_refunds }
+                name: { type: string, example: Refunds bot }
+                description: { type: [string, "null"] }
+      responses:
+        "201":
+          description: Added
+          content: { application/json: { schema: { $ref: "#/components/schemas/CatalogAgent" } } }
+        "400": { $ref: "#/components/responses/ValidationFailed" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /api/v1/agents/configured:
+    get:
+      tags: [Agents]
+      summary: "Agents with stored credentials (masked). Permission: agents.view"
+      operationId: agentsListConfigured
+      parameters: [{ $ref: "#/components/parameters/TenantId" }, { $ref: "#/components/parameters/EnvironmentId" }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  agents: { type: array, items: { type: object, additionalProperties: true } }
+        "400": { $ref: "#/components/responses/ScopeRequired" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    post:
+      tags: [Agents]
+      summary: "Store (or rotate) an agent's API key + secret, encrypted at rest. Permission: agents.configure"
+      operationId: agentsConfigure
+      parameters: [{ $ref: "#/components/parameters/TenantId" }, { $ref: "#/components/parameters/EnvironmentId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [agent_id, api_key, api_secret]
+              properties:
+                agent_id: { type: string, format: uuid, description: Catalog agent id }
+                api_key: { type: string, writeOnly: true }
+                api_secret: { type: string, writeOnly: true }
+      responses:
+        "200":
+          description: Saved
+          content: { application/json: { schema: { type: object, additionalProperties: true } } }
+        "201":
+          description: Saved
+          content: { application/json: { schema: { type: object, additionalProperties: true } } }
+        "400": { $ref: "#/components/responses/ValidationFailed" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /api/v1/agents/configured/{id}:
+    parameters: [{ $ref: "#/components/parameters/Id" }]
+    delete:
+      tags: [Agents]
+      summary: "Remove an agent's stored credentials. Permission: agents.configure"
+      operationId: agentsUnconfigure
+      parameters: [{ $ref: "#/components/parameters/TenantId" }, { $ref: "#/components/parameters/EnvironmentId" }]
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+        "400": { $ref: "#/components/responses/ScopeRequired" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  # ----------------------------------------------------------------- actions
+  /api/v1/actions:
+    get:
+      tags: [Actions]
+      summary: "Recent actions in the scope. Permission: actions.view"
+      operationId: actionsList
+      parameters:
+        - { $ref: "#/components/parameters/TenantId" }
+        - { $ref: "#/components/parameters/EnvironmentId" }
+        - { name: status, in: query, schema: { type: string } }
+        - { name: agent_id, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 200, default: 50 } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  actions: { type: array, items: { type: object, additionalProperties: true } }
+        "400": { $ref: "#/components/responses/ScopeRequired" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /api/v1/actions/propose:
+    post:
+      tags: [Actions]
+      summary: "Propose an action as a configured agent (the server adds a fresh nonce). Permission: actions.propose"
+      operationId: actionsPropose
+      parameters: [{ $ref: "#/components/parameters/TenantId" }, { $ref: "#/components/parameters/EnvironmentId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [agent_id, body]
+              properties:
+                agent_id: { type: string, format: uuid, description: Configured agent id }
+                body:
+                  description: The action body, as an object or JSON text
+                  oneOf: [{ type: object, additionalProperties: true }, { type: string }]
+            example:
+              agent_id: 00000000-0000-4000-8000-000000000000
+              body: { target_system: payments, action_type: refund, amount: 25.5, currency: USD, recipient: cust_123, session_id: sess_1 }
+      responses:
+        "200":
+          description: The gateway's decision (allowed / pending approval / denied) and ids
+          content: { application/json: { schema: { type: object, additionalProperties: true } } }
+        "400": { $ref: "#/components/responses/ValidationFailed" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "502": { $ref: "#/components/responses/Upstream" }
+  /api/v1/actions/{id}:
+    parameters: [{ name: id, in: path, required: true, description: Action event id, schema: { type: string } }]
+    get:
+      tags: [Actions]
+      summary: "One action, with its approval task when pending. Permission: actions.view"
+      operationId: actionsGet
+      parameters: [{ $ref: "#/components/parameters/TenantId" }, { $ref: "#/components/parameters/EnvironmentId" }]
+      responses:
+        "200":
+          description: OK
+          content: { application/json: { schema: { type: object, additionalProperties: true } } }
+        "400": { $ref: "#/components/responses/ScopeRequired" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/actions/{id}/execute:
+    parameters: [{ name: id, in: path, required: true, description: Action event id, schema: { type: string } }]
+    post:
+      tags: [Actions]
+      summary: "Execute an approved/allowed action. Permission: actions.execute"
+      operationId: actionsExecute
+      parameters: [{ $ref: "#/components/parameters/TenantId" }, { $ref: "#/components/parameters/EnvironmentId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                execution_id: { type: string, description: From the proposal or the approval task }
+                grant_id: { type: string }
+                endpoint: { type: string, enum: [interceptor, tracking], default: interceptor }
+                headers:
+                  type: object
+                  additionalProperties: { type: string }
+                  description: 'Extra test headers, e.g. {"x-decision":"failed"}'
+      responses:
+        "200":
+          description: The gateway's execution result
+          content: { application/json: { schema: { type: object, additionalProperties: true } } }
+        "400": { $ref: "#/components/responses/ValidationFailed" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "502": { $ref: "#/components/responses/Upstream" }
+
+components:
+  securitySchemes:
+    session:
+      type: apiKey
+      in: cookie
+      name: cots_admin_session
+      description: Set by the WorkOS callback (httpOnly). Copy it from the browser to use it in Postman.
+
+  parameters:
+    Id:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    TenantId:
+      name: x-tenant-id
+      in: header
+      required: true
+      description: Admin tenant id (`<platform>:<cots_tenant_id>`, e.g. `release0:ten_acme`), on the session platform
+      schema: { type: string, example: "release0:ten_acme" }
+    EnvironmentId:
+      name: x-environment-id
+      in: header
+      required: true
+      description: Environment id (uuid) of that tenant
+      schema: { type: string, format: uuid }
+
+  responses:
+    Ok:
+      description: Done
+      content:
+        application/json:
+          schema: { type: object, properties: { ok: { type: boolean, example: true } } }
+    Unauthenticated:
+      description: No or expired session
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: { code: unauthenticated, message: Sign in required } }
+    Forbidden:
+      description: Missing permission, or no access to that platform/tenant/environment
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          examples:
+            permission: { value: { error: { code: permission_denied, message: Missing permission users.manage } } }
+            tenant: { value: { error: { code: tenant_forbidden, message: No access to this tenant } } }
+            platform: { value: { error: { code: platform_locked, message: The session is on another platform } } }
+    NotFound:
+      description: Not found
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: { code: not_found, message: Not found } }
+    Conflict:
+      description: Conflicts with the current state (duplicate, last super admin, a run in progress, ...)
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    Rejected:
+      description: Not allowed in the current state (role_locked, last_super_admin, invalid_platform, invalid_body, ...)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: { code: last_super_admin, message: The last super admin can't be removed } }
+    ValidationFailed:
+      description: Invalid request body or query
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: { code: validation_failed, message: Invalid request, detail: { fieldErrors: { email: [Invalid email] } } } }
+    ScopeRequired:
+      description: x-tenant-id / x-environment-id missing or invalid
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    PlatformNotChosen:
+      description: No platform chosen for this session yet (POST /api/v1/me/platform), or a different one requested
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: { code: platform_not_chosen, message: Choose a platform first } }
+    Upstream:
+      description: The platform's action gateway failed or is unreachable
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string }
+            message: { type: string }
+            detail: {}
+    Health:
+      type: object
+      properties:
+        status: { type: string, enum: [ok, unavailable] }
+        checks:
+          type: object
+          additionalProperties: { type: string }
+    User:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        email: { type: string, format: email }
+        name: { type: [string, "null"] }
+        status: { type: string, enum: [active, disabled] }
+    UserRow:
+      allOf:
+        - { $ref: "#/components/schemas/User" }
+        - type: object
+          properties:
+            last_login_at: { type: [string, "null"], format: date-time }
+            invited_at: { type: [string, "null"], format: date-time }
+            created_at: { type: string, format: date-time }
+            roles: { type: array, items: { $ref: "#/components/schemas/Assignment" } }
+    Assignment:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        user_id: { type: string, format: uuid }
+        role_id: { type: string, format: uuid }
+        role_key: { type: string }
+        role_name: { type: string }
+        platform: { type: [string, "null"] }
+        tenant_id: { type: [string, "null"] }
+        tenant_name: { type: [string, "null"] }
+        environment_id: { type: [string, "null"] }
+        environment_name: { type: [string, "null"] }
+        created_at: { type: string, format: date-time }
+    Permission:
+      type: object
+      properties:
+        key: { type: string, example: users.manage }
+        scope: { type: string, enum: [global, tenant] }
+        description: { type: string }
+    Role:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        key: { type: string, example: tenant_admin }
+        name: { type: string }
+        description: { type: [string, "null"] }
+        is_system: { type: boolean }
+        permissions: { type: array, items: { type: string } }
+        assignment_count: { type: integer }
+    RoleUpdate:
+      type: object
+      required: [name, permissions]
+      properties:
+        name: { type: string, maxLength: 100 }
+        description: { type: [string, "null"], maxLength: 500 }
+        permissions: { type: array, items: { type: string }, maxItems: 100 }
+    RoleCreate:
+      allOf:
+        - { $ref: "#/components/schemas/RoleUpdate" }
+        - type: object
+          required: [key]
+          properties:
+            key: { type: string, pattern: "^[a-z][a-z0-9_]{1,49}$" }
+    Config:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        setting_id: { type: string, example: platform }
+        key: { type: string, example: release0 }
+        data: { type: string }
+        data_type: { type: string, enum: [json, text] }
+        status: { type: string, enum: [active, inactive, suspended] }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    ConfigUpdate:
+      type: object
+      required: [data]
+      properties:
+        data: { type: string, maxLength: 10000 }
+        data_type: { type: string, enum: [json, text], default: text }
+        status: { type: string, enum: [active, inactive, suspended], default: active }
+    ConfigCreate:
+      allOf:
+        - { $ref: "#/components/schemas/ConfigUpdate" }
+        - type: object
+          required: [setting_id, key]
+          properties:
+            setting_id: { type: string, pattern: "^[a-z0-9_.-]{1,100}$" }
+            key: { type: string, pattern: "^[a-z0-9_.-]{1,100}$" }
+    PlatformInfo:
+      type: object
+      properties:
+        key: { type: string, example: release0 }
+        name: { type: string, example: Release 0 }
+      additionalProperties: true
+    ScopeView:
+      type: object
+      description: A tenant + environment (with names and platform)
+      additionalProperties: true
+    ScopeState:
+      type: object
+      properties:
+        session_platform: { oneOf: [{ $ref: "#/components/schemas/PlatformInfo" }, { type: "null" }] }
+        default_platform: { type: [string, "null"] }
+        selected: { oneOf: [{ $ref: "#/components/schemas/ScopeView" }, { type: "null" }] }
+        suggested: { oneOf: [{ $ref: "#/components/schemas/ScopeView" }, { type: "null" }] }
+        platforms: { type: array, items: { $ref: "#/components/schemas/PlatformInfo" } }
+        permissions: { type: array, items: { type: string } }
+    Tenant:
+      type: object
+      properties:
+        id: { type: string, example: "release0:ten_acme" }
+        platform: { type: string, example: release0 }
+        cots_tenant_id: { type: string, example: ten_acme }
+        name: { type: string, example: Acme Insurance }
+      additionalProperties: true
+    Environment:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        slug: { type: string, example: dev }
+        name: { type: string }
+        cots_environment_id: { type: [string, "null"] }
+      additionalProperties: true
+    CatalogAgent:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        cots_agent_id: { type: string }
+        name: { type: string }
+        description: { type: [string, "null"] }
+      additionalProperties: true
